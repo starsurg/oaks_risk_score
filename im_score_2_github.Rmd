@@ -1,0 +1,444 @@
+---
+title: "Results"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = F, error = F, message=F, warning=F, fig.align="centre")
+library(finalfit);library(ggplot2); library(forcats); library(purrr)
+library(knitr); library(dplyr)
+
+source('~/shared_starsurg/recon/riskscore/functions.R')
+
+data <- readr::read_rds(here::here("IMAGINE/im_paper/im_data/score_data.rds")) %>%
+  dplyr::mutate(across(c(dag, country_all, country_fct), as.character)) %>%
+  dplyr::mutate(dag = ifelse(project=="dundee", "dundee", dag),
+                country_fct = ifelse(project=="dundee", "United Kingdom", country_fct),
+                country_all = ifelse(project=="dundee", "uk", country_all)) %>%
+  dplyr::mutate(op_speciality = factor(op_speciality, levels = c("cr", "ugi", "hpb"),
+                                       labels = c("Colorectal", "Upper Gastrointestinal", "Hepatopancreatobiliary")),
+                op_approach_planned_2l = forcats::fct_rev(op_approach_planned_2l),
+                 pt_sex = forcats::fct_rev(pt_sex)) %>%
+  dplyr::mutate(country_2l = finalfit::ff_label(country_2l, "Country"),
+                op_speciality = finalfit::ff_label(op_speciality, "Operative Sub-speciality"),
+                op_urgency = finalfit::ff_label(op_urgency, "Operative Urgency"),
+                pt_age = finalfit::ff_label(pt_age, "Age (years)"),
+                pt_sex = finalfit::ff_label(pt_sex, "Sex"),
+                pt_asa = finalfit::ff_label(pt_asa, "ASA Grade"),
+                op_approach_planned_2l = finalfit::ff_label(op_approach_planned_2l, "Planned Operative Approach"),
+                pt_preop_ace = finalfit::ff_label(pt_preop_ace, "Preoperative ACEi/ARB"),
+                pt_egfr_base = finalfit::ff_label(pt_egfr_base, "eGFR (ml per min per 1·73 m2)"),
+                aki_yn = finalfit::ff_label(aki_yn, "7-day AKI"))
+
+
+var_exp = c("pt_age", "pt_sex", "pt_egfr", "I(pt_egfr^2)", "op_approach_planned_2l", "pt_asa", "pt_preop_ace")
+var_dep = "aki_yn"
+
+data_oaks <- data %>%
+  dplyr::filter(project=="oaks") %>%
+  dplyr::mutate(project = forcats::fct_drop(project)) %>%
+  dplyr::select(project, country_all, dag, pt_age, pt_sex, pt_egfr_base, pt_egfr,
+                op_approach_planned_2l, pt_asa, pt_preop_ace, aki_yn)
+
+fit <- finalfit::glmmulti(data_oaks, dependent = var_dep, explanatory = var_exp)
+```
+
+```{r predict, include=TRUE, echo=FALSE}
+# Dundee
+data_dundee <- data %>%
+  filter(project=="dundee") %>%
+  filter(is.na(aki_yn)==F) %>%
+  dplyr::mutate(project = forcats::fct_drop(project)) %>%
+  dplyr::select(project, country_all, dag, pt_age, pt_sex, pt_egfr_base, pt_egfr,
+                op_approach_planned_2l, pt_asa, pt_preop_ace, aki_yn) %>%
+      tidyr::drop_na() %>%
+ dplyr::mutate(predict = predict(fit, type = "response", newdata = .),
+               predict2 = predict(fit, newdata = .))
+
+# Impute IMAGINE
+imp_centre <- c("project", "country_all", "dag")
+imp_single <- c("op_approach_planned_2l")
+imp_exp <- c("pt_age", "pt_sex", "pt_egfr", "pt_asa", "pt_preop_ace")
+imp_dep <- c("aki_yn")
+
+data_imagine <- data %>%
+  filter(is.na(aki_yn)==F) %>%
+  filter(project=="imagine") %>%
+  dplyr::select(all_of(imp_centre),all_of(imp_dep),  all_of(imp_exp), all_of(imp_single))
+
+# Imputation
+pred <- data_imagine %>%
+  finalfit::missing_predictorMatrix(drop_from_imputed = c(imp_centre, imp_single, imp_dep))
+
+mids <- data_imagine %>%
+  mice::mice(m = 10, predictorMatrix = pred, nnet.MaxNWts = 2000, seed = 1)
+
+# Predict risk based on each dataset separately then get mean
+mi_predict <- mice::complete(mids, "long") %>%
+  tibble::as_tibble() %>%
+  group_split(.imp) %>%
+  purrr::map_dfr(.id = "imputed", function(x){ x %>%
+      dplyr::select(all_of(imp_centre), all_of(imp_dep), all_of(imp_exp), all_of(imp_single)) %>%
+      dplyr::mutate(predict = predict(fit, type = "response", newdata = .))}) %>%
+  dplyr::mutate(imputed = factor(imputed)) %>%
+  dplyr::select(imputed, predict) %>%
+  tidyr::pivot_wider(names_from = "imputed", values_from = "predict") %>%
+  tidyr::unnest(cols = everything()) %>%
+  rowMeans()
+
+mi_predict2 <- mice::complete(mids, "long") %>%
+  tibble::as_tibble() %>%
+  group_split(.imp) %>%
+  purrr::map_dfr(.id = "imputed", function(x){ x %>%
+      dplyr::select(all_of(imp_centre), all_of(imp_dep), all_of(imp_exp), all_of(imp_single)) %>%
+      dplyr::mutate(predict2 = predict(fit, newdata = .))}) %>%
+  dplyr::mutate(imputed = factor(imputed)) %>%
+  dplyr::select(imputed, predict2) %>%
+  tidyr::pivot_wider(names_from = "imputed", values_from = "predict2") %>%
+  tidyr::unnest(cols = everything()) %>%
+  rowMeans()
+
+data_imagine <- data_imagine %>% dplyr::mutate(predict = mi_predict,
+                                               predict2 = mi_predict2)
+  
+data_predict <-  bind_rows(data_imagine, data_dundee) %>%
+  dplyr::mutate(risk_class = cut(predict,
+                                 breaks = c(0, 0.1, 0.2, 1),
+                                 labels = c("Low-risk", "Medium-risk", "High-risk")) %>% forcats::fct_rev()) %>%
+  dplyr::mutate(risk_class_2l = forcats::fct_collapse(risk_class, "Low-Medium Risk" = c("Low-risk", "Medium-risk")))
+  
+```
+
+
+*Validation study overview*
+
+```{r tab1, include=TRUE, echo=FALSE}
+source('~/shared_starsurg/functions/extract_finalfit.R')
+
+var_dem  <- c("country_2l", "op_speciality", "op_urgency", "pt_age", "pt_sex",
+              "pt_egfr_base", "op_approach_planned_2l", "pt_asa", "pt_preop_ace")
+
+table1 <- data %>%
+  dplyr::filter(is.na(aki_yn)==F) %>%
+  # dplyr::filter(stringr::str_detect(dag, "es_")==F) %>%
+  dplyr::mutate(pt_age = cut(pt_age, breaks=c(0, 55, 65, 75, 100),
+                             labels = c("< 55", "55 to 64", "65 to 74", "≥ 75")),
+                pt_age = finalfit::ff_label(pt_age, "Age (years)")) %>%
+  dplyr::select(project, all_of(var_dem)) %>%
+  finalfit::summary_factorlist(dependent = "project",
+                               explanatory = var_dem,
+                               column = TRUE, na_include = T)  # ensure missing not included in p value
+```
+
+*Comparison with model development data*
+  
+### Table 1: Demographics  of derivation and external validation cohorts
+```{r, include=TRUE, echo=FALSE}
+  knitr::kable(table1)
+```
+
+## External validation:
+
+```{r added_roc, include=TRUE, echo=FALSE}
+model_auc <- data_predict %>%
+  dplyr::group_split(project) %>%
+  purrr::map_df(function(x){
+    dplyr::bind_cols("project" = unique(x$project),
+                     roc_metric(x, original = "aki_yn", predictor = "predict"))}) %>%
+  dplyr::filter(name == "AUC") %>%
+  dplyr::select(project, metric) %>%
+  tidyr::pivot_wider(names_from = "project", values_from = "metric")
+```
+
+```{r risk class, echo=FALSE}
+
+tab_aki_1 <- data_predict %>%
+  dplyr::group_by(project) %>%
+  dplyr::summarise(pt_n = n(),
+                   aki_n = sum(aki_yn == "Yes")) %>%
+  dplyr::mutate(risk_class = "Overall cohort") %>%
+  dplyr::mutate(aki_pct = scales::percent(aki_n/pt_n, accuracy = 0.1),
+                pt_pct = "") %>%
+  select(risk_class, everything())
+
+tab_aki_2 <- data_predict %>%
+  dplyr::group_by(project, risk_class) %>%
+  dplyr::summarise(.groups = "drop",
+                   pt_n = n(),
+                   aki_n = sum(aki_yn == "Yes")) %>%
+    dplyr::group_by(project) %>%
+  dplyr::mutate(pt_total = sum(pt_n)) %>%
+  dplyr::mutate(aki_pct = scales::percent(aki_n/pt_n, accuracy = 0.1),
+                pt_pct = scales::percent(pt_n/pt_total, accuracy = 0.1))
+
+tab_oaks <- tibble::tibble(project = c("oaks", "oaks", "oaks", "oaks"),
+                           Group = c("Overall cohort", "High-risk", "Medium-risk", "Low-risk"),
+                           Patients = c("All (n=4544)","14.6% (n=662)","54.9% (n=2494)","30.6% (n=1388)"),
+                           AKI = c("14.2% (n=646)", "28.5% (n=189)", "14.4% (n=359)", "7.1% (n=99)"))
+
+
+table2 <- bind_rows(tab_aki_1, tab_aki_2) %>%
+  dplyr::mutate(pt = ifelse(pt_pct!="", paste0(pt_pct, " (n=", pt_n, ")"), paste0("All (n=", pt_n, ")")),
+                aki = paste0(aki_pct, " (n=", aki_n, ")")) %>%
+  dplyr::select(project, Group = "risk_class","Patients" = pt,"AKI" = aki) %>%
+  dplyr::bind_rows(tab_oaks) %>%
+  tidyr::pivot_wider(names_from = "project", values_from = c("Patients", "AKI")) %>%
+  dplyr::select(Group, ends_with("oaks"),  ends_with("imagine"), ends_with("impute"),  ends_with("dundee"))
+
+data_impute <- mice::complete(mids, "long") %>%
+  tibble::as_tibble() %>%
+  group_split(.imp) %>%
+  purrr::map_dfr(.id = "imputed", function(x){ x %>%
+      dplyr::select(all_of(imp_centre), all_of(imp_dep), all_of(imp_exp), all_of(imp_single)) %>%
+      dplyr::mutate(predict = predict(fit, type = "response", newdata = .),
+                    predict2 = predict(fit, newdata = .))}) %>%
+  dplyr::mutate(aki_yn = as.numeric(aki_yn)-1,
+                status = "impute") %>%
+  dplyr::select(status, aki_yn, predict, predict2)
+
+calibration_test <- data_dundee %>%
+    dplyr::mutate(aki_yn = as.numeric(aki_yn)-1) %>%
+    dplyr::select(project, predict2, aki_yn) %>%
+  bind_rows(data_impute %>% rename("project" = "status") %>% select(-predict)) %>%
+  dplyr::group_split(project) %>% 
+  purrr::map_df(function(x){
+    
+    fit_intercept <- glm(aki_yn ~ 1, offset = predict2, data=x, family="binomial")
+    
+    fit_slope <- glm(aki_yn ~ predict2, data=x, family="binomial")
+    
+    
+    tibble::tibble("project" = unique(x$project),
+                   "Intercept" = fit_intercept$coefficients,
+                   "Slope" = fit_slope$coefficients[2])}) %>%
+  dplyr::mutate(project = factor(project,
+                                 levels = c("impute", "dundee"),
+                                 labels = c("IMAGINE Cohort (Imputed)", "Tayside Cohort"))) %>%
+  dplyr::mutate(Intercept = format(round(Intercept,3), nsmall = 3),
+                Slope = format(round(Slope, 2), nsmall = 2)) %>%
+  dplyr::mutate(label = paste0(project, "\n(Intercept = ", Intercept, ", Slope = ", Slope, ")"))
+    
+```
+
+*Prognostic model performance and diagnostic accuracy*
+
+### Figure 2: Calibration Loess curve of observed 7-day postoperative acute kidney injury (AKI) events versus predicted probability of these events in the IMAGINE and Tayside cohorts.
+
+```{r fig_calibration, fig.width=9, fig.height=4}
+update = F
+if(update == T){
+cal_plot <- data_dundee %>%
+    dplyr::mutate(aki_yn = as.numeric(aki_yn)-1) %>%
+    dplyr::select(project, predict, aki_yn) %>%
+  bind_rows(data_impute %>% rename("project" = "status") %>% select(-predict2)) %>%
+  dplyr::mutate(project  = factor(project, levels = c("dundee", "impute"),
+                                  labels = calibration_test$label),
+                project = forcats::fct_rev(project)) %>%
+  ggplot() +
+  aes(x = predict, y = aki_yn) +
+  geom_jitter(aes(colour = project), height = 0.01, show.legend = F) +
+  geom_smooth(aes(colour = project), method = "loess", se = F, show.legend = F,
+              method.args=loess.control(statistics = "approximate", trace.hat = "approximate")) +
+  geom_abline(xintercept =0, yintercept =0) +
+  
+  scale_x_continuous(name = "Predicted Probability of 7-Day Postoperative Acute Kidney Injury (AKI)",
+                     limits = c(0, 0.4)) +
+  scale_y_continuous(name = "Observed 7-Day Postoperative AKI",
+                     limits = c(0, 1), breaks = c(0,1), labels = c("No", "Yes")) +
+  theme_bw(base_size = 18) +
+  facet_wrap(~ project)
+  
+ggsave(plot = cal_plot, filename = "cal_plot.png",
+       path  = here::here("OAKS-2/oaks2_mainpaper/plot"),
+       width = 9,height = 4, units = "in", dpi = 300)}
+  
+knitr::include_graphics(here::here("OAKS-2/oaks2_mainpaper/plot/cal_plot.png"))
+```
+
+### Table 2: Proportion of patients in each of the three risk groups in external validation cohort
+
+```{r}
+knitr::kable(table2)
+```
+
+
+### Figure 3: Predictive performance of the three prespecificed risk subgroups in the external validation cohorts
+
+```{r, fig.height = 4, fig.width=10}
+tab_val <- data_predict %>%
+  dplyr::group_by(project, risk_class) %>%
+  dplyr::summarise(.groups = "drop",
+                   pt_n = n(),
+                   aki_n = sum(aki_yn == "Yes"))
+
+tab_oaks <- tibble::tibble(project = c("oaks", "oaks", "oaks"),
+                           risk_class = c("High-risk", "Medium-risk", "Low-risk"),
+                           pt_n = c(662, 2494, 1388),
+                           aki_n = c(189, 359, 99))
+
+
+bind_rows(tab_val, tab_oaks) %>%
+  dplyr::mutate(risk_class = factor(risk_class, levels = c("High-risk", "Medium-risk", "Low-risk"))) %>%
+  dplyr::mutate(Dataset = factor(project, levels = c("oaks","imagine", "dundee"), labels = c("OAKS","IMAGINE","Tayside"))) %>%
+  dplyr::mutate(Dataset = forcats::fct_rev(Dataset)) %>%
+  group_split(project, risk_class) %>%
+  purrr::map_df(function(x){binom::binom.confint(x = x$aki_n, n = x$pt_n, methods ="wilson") %>% 
+      dplyr::select(-n, -x, -method) %>%
+      bind_cols(x, .)}) %>%
+  ggplot()+
+  aes(y = risk_class) +
+  geom_linerange(aes(x = mean, xmin = lower, xmax = upper, colour = Dataset), size = 2, position = position_dodge(width = 1.1)) +
+  geom_point(aes(x = mean, colour = Dataset),  size = 5, position = position_dodge(width = 1.1)) + 
+  geom_vline(xintercept = 0.1, linetype = "dashed") +
+  geom_vline(xintercept = 0.2, linetype = "dashed") +
+  
+  scale_x_continuous(name = "Observed Postoperative Acute Kidney Injury Rate",
+                     breaks=seq(0, 0.4, by = 0.05), limits = c(0, NA),
+                     labels = scales::percent(seq(0, 0.4, by = 0.05), accuracy = 1)) +
+  scale_y_discrete(name = "Predicted Risk Classification of\nPostoperative Acute Kidney Injury") +
+  scale_color_manual(values=c( "#00BfC4", "#F8766D", "#00BA38")) +
+  theme_bw(base_size = 15)
+
+```
+
+```{r table4, fig.height = 4, fig.width=10}
+
+oaks_metrics <- tibble::enframe(epiR::epi.tests(as.table(matrix(c(189,	457, 473, 3425),
+                                                                nrow = 2, ncol = 2)))$elements) %>% 
+  dplyr::filter(name %in% c("aprev", "tprev", "diag.acc", "sensitivity",
+                            "specificity",  "pv.positive","pv.negative", "lr.positive",  "lr.negative")) %>%
+  dplyr::mutate(name = factor(name,
+                              levels = c("aprev", "tprev", "diag.acc", "sensitivity",  "specificity",  "lr.positive",  "lr.negative",  "pv.positive","pv.negative"),
+                              labels = c("Predicted Prevalence", "True Prevalence",
+                                         "Diagnostic Accuracy", "Sensitivity", "Specificity",
+                                         "Positive Likelihood Ratio", "Negative Likelihood Ratio",
+                                         "Positive Predictive Value", "Negative Predictive Value"))) %>%
+  dplyr::arrange(name) %>%
+  dplyr::mutate(abbr = c("", "", "", "SEN", "SPE", "PLR", "NLR", "PPV", "NPV"),
+                project = "oaks") %>%
+  dplyr::select(project, name, abbr, value) %>%
+  tidyr::unnest(cols = "value") %>%
+  dplyr::rename("estimate" = est, "lci" = lower, "uci" = upper) %>%
+  dplyr::mutate(metric = paste0(format(round(estimate, 3), digits=3),
+                                " (95% CI: ",
+                                format(round(lci, 3), digits=3), " to ",
+                                format(round(uci, 3), digits=3), ")"))
+
+
+
+roc_metrics <- data_predict %>%
+  dplyr::mutate(risk_class_2l = forcats::fct_rev(risk_class_2l)) %>%
+  dplyr::group_split(project) %>%
+  purrr::map_df(function(x){
+    dplyr::bind_cols("project" = unique(x$project),
+                     roc_metric(x, original = "aki_yn", predictor = "risk_class_2l"))}) %>%
+  dplyr::bind_rows(oaks_metrics) %>%
+  dplyr::mutate(project = factor(project, levels = c("oaks", "imagine","imagine_impute", "dundee"))) %>%
+  dplyr::arrange(project) %>%
+  dplyr::filter(abbr %in% c("SEN", "SPE", "PPV", "NPV"))
+  
+  
+table4 <- roc_metrics %>%
+  dplyr::select(project, name, metric) %>%
+  tidyr::pivot_wider(id_cols = "name", names_from = "project", values_from = "metric")
+
+```
+
+### Table 3:  Diagnostic Accuracy of the OAKS risk score in identification of patients at high-risk of AKI in the derivation and external validation cohorts
+
+```{r}
+knitr::kable(table4, align = c("l", "r", "r", "r", "r"),
+             col.names = c("", "Derivation cohort (OAKS)", "Validation cohort (IMAGINE)", "Validation cohort (Tayside)")) 
+
+```
+
+## Supplement
+
+```{r supp_table1, fig.height = 4, fig.width=10}
+
+data_complete <- data_imagine %>%
+  tidyr::drop_na() %>%
+ dplyr::mutate(predict = predict(fit, type = "response", newdata = .),
+               predict2 = predict(fit, newdata = .),
+               aki_yn = as.numeric(aki_yn)-1,
+               status = "complete")  %>%
+  dplyr::select(status, aki_yn, predict, predict2)
+
+data_sen <- bind_rows(data_impute, data_complete)
+
+cal_test_sen <- data_sen %>%
+  dplyr::select(status, predict2, aki_yn) %>%
+  dplyr::group_split(status) %>% 
+  purrr::map_df(function(x){
+    
+    fit_intercept <- glm(aki_yn ~ 1, offset = predict2, data=x, family="binomial")
+    
+    fit_slope <- glm(aki_yn ~ predict2, data=x, family="binomial")
+    
+    
+    tibble::tibble("status" = unique(x$status),
+                   "Intercept" = fit_intercept$coefficients,
+                   "Slope" = fit_slope$coefficients[2])}) %>%
+ 
+  dplyr::mutate(Intercept = format(round(Intercept,3), nsmall = 3),
+                Slope = format(round(Slope, 2), nsmall = 2)) %>%
+  dplyr::mutate(label = paste0(status, " (Intercept = ", Intercept, ", Slope = ", Slope, ")")) %>%
+  dplyr::mutate(status = factor(status,
+                                 levels = c("complete","impute"),
+                                 labels = c("IMAGINE Cohort (Complete-case)",
+                                            "IMAGINE Cohort (Multiple Imputed)"))) %>%
+  dplyr::mutate(across(Intercept:Slope, function(x){stringr::str_split_fixed(x, " ", 2)[,1]})) %>%
+  dplyr::mutate(label = paste0(status, "\n(Intercept = ", Intercept, ", Slope = ", Slope, ")"))
+      
+```
+
+#### Calibration Loess curve of observed 7-day postoperative acute kidney injury (AKI) events versus predicted probability of these events in the IMAGINE cohort based on Multiple Imputation or Complete-case analysis.
+```{r, fig.height = 6, fig.width=9}
+
+update = F
+if(update == T){
+sen_plot <-   data_sen %>%
+  dplyr::select(status, predict, aki_yn) %>%
+  dplyr::mutate(status = factor(status,
+                                levels = c("impute","complete"),
+                                labels = levels(cal_test_sen$status))) %>%
+  dplyr::mutate(status = forcats::fct_rev(status)) %>%
+  ggplot() +
+  aes(x = predict, y = aki_yn) +
+  geom_jitter(aes(colour = status), height = 0.01, show.legend = F) +
+  geom_smooth(aes(colour = status), method = "loess", se = F, show.legend = F,
+              method.args=loess.control(statistics = "approximate", trace.hat = "approximate")) +
+  geom_abline(xintercept =0, yintercept =0) +
+  geom_text(data =cal_test_sen, aes(x = 0.1, y = c(rep(0.57, 1), rep(0.77, 1)), label = label),
+            colour = c(rep("#F8766D", 1), rep("#00BFC4", 1)),
+            size = 5.5, fontface = "bold", show.legend = F) +
+  scale_x_continuous(name = "Predicted Probability of 7-Day Postoperative Acute Kidney Injury (AKI)", limits = c(0, 0.4)) +
+  scale_y_continuous(name = "Observed 7-Day Postoperative AKI",
+                     limits = c(0, 1), breaks = c(0,1), labels = c("No", "Yes")) +
+  theme_bw(base_size = 18)
+
+ggsave(plot = sen_plot, filename = "sen_plot.png",
+       path  = here::here("OAKS-2/oaks2_mainpaper/plot"),
+       width = 9,height = 6, units = "in", dpi = 300)}
+  
+knitr::include_graphics(here::here("OAKS-2/oaks2_mainpaper/plot/sen_plot.png"))
+```
+
+#### Supplementary Table 1: Diagnostic Accuracy of the OAKS risk score in identification of patients at high-risk of AKI in IMAGINE cohort based on Multiple Imputation or Complete-case analysis
+```{r}
+data_sen %>%
+ dplyr::mutate(risk_class_2l = forcats::fct_rev(risk_class_2l)) %>%
+  dplyr::group_split(status) %>%
+  purrr::map_df(function(x){
+    dplyr::bind_cols("status" = unique(x$status),
+                     roc_metric(x, original = "aki_yn", predictor = "risk_class_2l"))}) %>%
+  dplyr::mutate(status = factor(status, levels = c("impute","complete"), labels = levels(hl_test_sen$status))) %>%
+  dplyr::arrange(desc(status)) %>%
+  dplyr::filter(abbr %in% c("SEN", "SPE", "PPV", "NPV")) %>%
+  dplyr::select(status, name, metric) %>%
+  tidyr::pivot_wider(id_cols = "name", names_from = "status", values_from = "metric") %>%
+knitr::kable(align = c("l", "r", "r"),
+             col.names = c("", "IMAGINE Cohort (Multiple Imputation)", "IMAGINE Cohort (Complete-Case)")) 
+```
+&nbsp;
+&nbsp;
